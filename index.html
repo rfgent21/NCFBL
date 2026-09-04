@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NB Schedule Viewer</title>
+  <style>
+    :root{
+      --gap:10px;
+      --muted:#666;
+      --accent:#0b6efd;
+      --card-bg:#fff;
+      --neutral-highlight:#fffbe6;
+      --max-width:1100px;
+    }
+    body { font-family: system-ui, Arial, sans-serif; padding: 14px; max-width: var(--max-width); margin: auto; color:#111; background:#f6f7fb; }
+    header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
+    h1 { margin:0; font-size:20px; }
+    .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    label.small { font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+    input[type="text"], input[type="date"], select { padding:6px 8px; font-size:14px; border:1px solid #d9dbe0; border-radius:6px; background:white; }
+    button { padding:7px 10px; font-size:14px; border-radius:6px; border:1px solid #cdd3db; background:white; cursor:pointer; }
+    button.primary { background:var(--accent); color:white; border-color:rgba(11,110,253,0.9); }
+    #message { margin-top:8px; color:var(--muted); font-size:13px; }
+
+    /* Table layout (desktop) */
+    .table-wrap { overflow:auto; background: white; border-radius:8px; padding:8px; box-shadow:0 1px 2px rgba(0,0,0,0.03); }
+    table { border-collapse: collapse; width:100%; min-width:760px; }
+    th, td { padding:8px 10px; border-bottom:1px solid #f0f0f2; text-align:left; vertical-align:middle; font-size:14px; }
+    th { background: #fbfdff; position: sticky; top:0; z-index:2; cursor:pointer; font-weight:600; color:#222; }
+    tbody tr.neutral { background: var(--neutral-highlight); }
+
+    /* Compact card layout (mobile) */
+    .cards { display:grid; grid-template-columns:1fr; gap:8px; }
+    .card { background:var(--card-bg); padding:10px; border-radius:8px; box-shadow:0 1px 2px rgba(0,0,0,0.04); display:grid; grid-template-columns: 1fr auto; gap:6px; align-items:center; }
+    .card .meta { font-size:13px; color:var(--muted); margin-bottom:6px; }
+    .card .teams { font-weight:700; font-size:15px; }
+    .card.neutral { background: var(--neutral-highlight); }
+
+    .col-label { font-weight:600; margin-right:6px; color:var(--muted); font-size:13px; }
+
+    /* Responsive breakpoints */
+    @media (max-width: 800px) {
+      :root { --max-width:820px; }
+      h1 { font-size:18px; }
+      table { min-width: 640px; }
+    }
+    @media (max-width: 680px) {
+      /* hide the table and use cards */
+      .table-wrap table { display:none; }
+      .cards { display:grid; }
+      .table-wrap { padding:6px; }
+      .controls { gap:6px; }
+      input[type="text"] { min-width:140px; }
+    }
+
+    @media (min-width: 681px) {
+      .cards { display:none; }
+    }
+
+    .nowrap { white-space:nowrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NB Schedule Viewer</h1>
+    <div class="controls" role="group" aria-label="controls">
+      <label class="small nowrap">Player:
+        <select id="playerFilter"><option value="">All players</option></select>
+      </label>
+
+      <label class="small">Search:
+        <input id="search" type="text" placeholder="Search any column">
+      </label>
+
+      <label class="small">From:
+        <input id="dateFrom" type="date" />
+      </label>
+      <label class="small">To:
+        <input id="dateTo" type="date" />
+      </label>
+
+      <button id="refresh" title="Force reload CSV">Refresh</button>
+      <button id="download" class="primary" title="Download visible rows as CSV">Download</button>
+
+      <label class="small">Auto-refresh:
+        <select id="autoRefresh">
+          <option value="0">Off</option>
+          <option value="60">1 min</option>
+          <option value="300">5 min</option>
+          <option value="900">15 min</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <div id="message">No data loaded.</div>
+
+  <div class="table-wrap" id="tableWrap" aria-live="polite"></div>
+
+  <!-- PapaParse -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script>
+    // CONFIG
+    const CSV_PATH = 'nbsch_flattened.csv'; // leave as-is (file at repo root)
+
+    // State
+    let allRows = [];
+    let headers = [];
+    let autoRefreshTimer = null;
+    const message = document.getElementById('message');
+    const tableWrap = document.getElementById('tableWrap');
+    const playerFilter = document.getElementById('playerFilter');
+    const search = document.getElementById('search');
+    const refreshBtn = document.getElementById('refresh');
+    const downloadBtn = document.getElementById('download');
+    const autoRefreshSel = document.getElementById('autoRefresh');
+    const dateFromEl = document.getElementById('dateFrom');
+    const dateToEl = document.getElementById('dateTo');
+
+    // Initial load
+    fetchAndRender();
+
+    // Events
+    refreshBtn.addEventListener('click', () => fetchAndRender(true));
+    search.addEventListener('input', () => renderFiltered());
+    playerFilter.addEventListener('change', () => renderFiltered());
+    downloadBtn.addEventListener('click', downloadVisible);
+    autoRefreshSel.addEventListener('change', () => setAutoRefresh(parseInt(autoRefreshSel.value,10) || 0));
+    dateFromEl.addEventListener('change', () => renderFiltered());
+    dateToEl.addEventListener('change', () => renderFiltered());
+    window.addEventListener('resize', () => renderFiltered());
+
+    function setAutoRefresh(seconds) {
+      if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+      if (seconds > 0) {
+        autoRefreshTimer = setInterval(() => fetchAndRender(true), seconds*1000);
+        message.textContent = `Auto-refresh every ${seconds} seconds.`;
+      } else {
+        message.textContent = 'Auto-refresh off.';
+      }
+    }
+
+    function fetchAndRender(forceReload=false) {
+      message.textContent = 'Loading CSV...';
+      const url = CSV_PATH + (forceReload ? ('?t=' + Date.now()) : '');
+      fetch(url)
+        .then(r => { if (!r.ok) throw new Error('Could not fetch CSV: ' + r.statusText); return r.text(); })
+        .then(text => {
+          Papa.parse(text, {
+            header: true,
+            skipEmptyLines: true,
+            complete: (res) => {
+              headers = res.meta.fields || [];
+              allRows = res.data.map(normalizeRow);
+              populatePlayerFilter();
+              renderFiltered();
+            },
+            error: (err) => { message.textContent = 'Parse error: ' + err.message; }
+          });
+        })
+        .catch(err => { message.textContent = 'Error fetching CSV: ' + err.message; });
+    }
+
+    function normalizeRow(r) {
+      const row = {};
+      for (const k of Object.keys(r)) row[k.trim()] = (r[k] || '').trim();
+
+      // Parse date - remove leading weekday token if present
+      const rawDate = row['Date'] || '';
+      const cleaned = rawDate.replace(/^[A-Za-z]+,\s*/, ''); // "Wednesday, October 21, 2026" -> "October 21, 2026"
+      const d = new Date(cleaned);
+      row._dateObj = isNaN(d.getTime()) ? null : d;
+      row._dateISO = row._dateObj ? row._dateObj.toISOString().slice(0,10) : '';
+
+      // Game #
+      row._game = parseInt(row['Game #'] || '', 10) || 0;
+
+      // Normalize Neutral to Y/N
+      row['Neutral'] = (row['Neutral'] || '').toUpperCase().startsWith('Y') ? 'Y' : 'N';
+
+      return row;
+    }
+
+    function populatePlayerFilter() {
+      const names = new Set();
+      allRows.forEach(r => { if (r['Away']) names.add(r['Away']); if (r['Home']) names.add(r['Home']); });
+      const arr = Array.from(names).sort((a,b)=>a.localeCompare(b));
+      playerFilter.innerHTML = '<option value="">All players</option>';
+      arr.forEach(n => {
+        const o = document.createElement('option'); o.value = n; o.textContent = n; playerFilter.appendChild(o);
+      });
+    }
+
+    function getFilteredRows() {
+      const player = playerFilter.value;
+      const q = (search.value || '').trim().toLowerCase();
+      const df = dateFromEl.value ? new Date(dateFromEl.value) : null;
+      const dt = dateToEl.value ? new Date(dateToEl.value) : null;
+      // include full day for dateTo (set to end of day)
+      if (dt) dt.setHours(23,59,59,999);
+
+      return allRows.filter(r => {
+        // player filter
+        if (player && r['Away'] !== player && r['Home'] !== player) return false;
+        // date range filter: if row has _dateObj, check; if no date and a filter is set, exclude
+        if ((df || dt)) {
+          if (!r._dateObj) return false;
+          const t = r._dateObj.getTime();
+          if (df && t < df.getTime()) return false;
+          if (dt && t > dt.getTime()) return false;
+        }
+        // search across columns
+        if (!q) return true;
+        for (const h of headers) {
+          if ((r[h] || '').toString().toLowerCase().includes(q)) return true;
+        }
+        return false;
+      }).sort((a,b) => {
+        const da = a._dateObj ? a._dateObj.getTime() : 0;
+        const db = b._dateObj ? b._dateObj.getTime() : 0;
+        if (da !== db) return da - db;
+        return a._game - b._game;
+      });
+    }
+
+    function renderFiltered() {
+      const rows = getFilteredRows();
+      message.textContent = `Showing ${rows.length} rows.`;
+      renderTable(rows);
+    }
+
+    // Render table OR cards depending on width
+    function renderTable(rows) {
+      if (!rows || rows.length === 0) { tableWrap.innerHTML = '<div style="padding:8px">No rows to show.</div>'; return; }
+
+      const cols = headers.length ? headers : ['Date','Game #','Away','Home','Neutral','Score Away','Score Home','Notes'];
+
+      // Build desktop table (hidden on small screens via CSS)
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const trh = document.createElement('tr');
+      cols.forEach(h => {
+        const th = document.createElement('th'); th.textContent = h;
+        th.addEventListener('click', () => sortByColumn(h));
+        trh.appendChild(th);
+      });
+      thead.appendChild(trh);
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      rows.forEach(r => {
+        const tr = document.createElement('tr');
+        if ((r['Neutral'] || '').toUpperCase() === 'Y') tr.classList.add('neutral');
+        cols.forEach(c => {
+          const td = document.createElement('td');
+          if (c === 'Date') td.textContent = r['Date'] || r._dateISO || '';
+          else if (c === 'Game #') td.textContent = r['Game #'] || (r._game || '');
+          else td.textContent = r[c] || '';
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+
+      // Build compact cards for narrow screens
+      const cards = document.createElement('div');
+      cards.className = 'cards';
+      rows.forEach(r => {
+        const cd = document.createElement('div'); cd.className = 'card';
+        if ((r['Neutral'] || '').toUpperCase() === 'Y') cd.classList.add('neutral');
+
+        const left = document.createElement('div');
+        const meta = document.createElement('div'); meta.className = 'meta';
+        meta.innerHTML = `<span class="col-label">Date</span>${r['Date'] || r._dateISO || ''} &nbsp; <span class="col-label">Game</span>${r['Game #'] || (r._game||'')}`;
+        const teams = document.createElement('div'); teams.className = 'teams';
+        teams.textContent = `${r['Away'] || ''}  —  ${r['Home'] || ''}`;
+
+        const extras = document.createElement('div'); extras.className = 'meta';
+        extras.innerHTML = `<span class="col-label">Neutral</span>${r['Neutral']||''} &nbsp; <span class="col-label">Score</span>${r['Score Away']||''} - ${r['Score Home']||''}`;
+
+        left.appendChild(meta);
+        left.appendChild(teams);
+        left.appendChild(extras);
+
+        const right = document.createElement('div');
+        right.style.textAlign = 'right';
+        right.innerHTML = `<div style="font-size:13px;color:var(--muted)">${(r['Notes']||'')}</div>`;
+
+        cd.appendChild(left);
+        cd.appendChild(right);
+        cards.appendChild(cd);
+      });
+
+      tableWrap.innerHTML = '';
+      tableWrap.appendChild(table);
+      tableWrap.appendChild(cards);
+    }
+
+    // Sorting state
+    let lastSort = { col: null, dir: 1 };
+    function sortByColumn(col) {
+      const rows = getFilteredRows();
+      const isNumeric = rows.every(r => {
+        const v = r[col];
+        return v === undefined ? false : (!isNaN(parseFloat(v)) && isFinite(v));
+      });
+
+      lastSort.dir = (lastSort.col === col) ? -lastSort.dir : 1;
+      lastSort.col = col;
+
+      rows.sort((a,b) => {
+        if (col === 'Date') {
+          const da = a._dateObj ? a._dateObj.getTime() : 0;
+          const db = b._dateObj ? b._dateObj.getTime() : 0;
+          return lastSort.dir * (da - db);
+        }
+        let va = (a[col] || '').toString();
+        let vb = (b[col] || '').toString();
+        if (isNumeric) return lastSort.dir * (parseFloat(va) - parseFloat(vb));
+        return lastSort.dir * va.localeCompare(vb);
+      });
+
+      renderTable(rows);
+    }
+
+    // Download visible rows as CSV
+    function downloadVisible() {
+      const rows = getFilteredRows();
+      if (!rows || rows.length === 0) { alert('No rows to download'); return; }
+      const out = rows.map(r => {
+        const obj = {};
+        headers.forEach(h => obj[h] = r[h] || '');
+        return obj;
+      });
+      const csv = Papa.unparse(out, { columns: headers });
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'nbsch_export.csv';
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }
+
+    // Expose helper to force reload from console
+    window.reloadSchedule = () => fetchAndRender(true);
+  </script>
+</body>
+</html>
